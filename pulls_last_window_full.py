@@ -29,6 +29,8 @@ import urllib.error
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from dotenv import load_dotenv
 
 # =========================
 # Configuration (EDIT ME)
@@ -51,8 +53,8 @@ INCLUDE_ISSUE_COMMENTS  = True      # top-level conversation comments
 INCLUDE_CHECKS_AND_STATUS = True    # check-runs + combined status per commit in the PR
 MAX_ITEMS_PER_SECTION = None        # e.g., set 500 to cap very large PRs; None = no cap
 
-from dotenv import load_dotenv
-load_dotenv()  # this will read the .env file into environment variables
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
+
 
 def die(msg: str) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
@@ -352,7 +354,8 @@ def main() -> None:
     token = os.getenv("GITHUB_TOKEN")
     if not token:
         die("GITHUB_TOKEN is not set. Please export a GitHub token with repo read access.")
-
+    if token:
+        print(f"Using token: {token[:6]}...{token[-4:]}")
     if not GITHUB_OWNER or not GITHUB_REPO:
         die("Please edit GITHUB_OWNER and GITHUB_REPO at the top of the script.")
 
