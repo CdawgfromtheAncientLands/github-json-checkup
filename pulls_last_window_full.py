@@ -62,14 +62,18 @@ def die(msg: str) -> None:
 
 
 class GitHub:
-    def __init__(self, token: str, base: str = "https://api.github.com"):
+    def __init__(self, token: str, base: str = "https://api.github.com", debug: bool = False):
+        cleaned_token = (token or "").strip()
+        if not cleaned_token:
+            raise ValueError("GitHub token must be non-empty")
         self.base = base
-        self.token = token
+        self.token = cleaned_token
+        self.debug = debug
 
     def headers(self) -> Dict[str, str]:
         return {
             "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {self.token}",
+            "Authorization": f"token {self.token}",
             "User-Agent": "pulls-last-window-full/1.0",
         }
 
@@ -83,11 +87,24 @@ class GitHub:
         backoff = 2.0
         for attempt in range(6):
             try:
+                if self.debug:
+                    print(f"[DEBUG] GitHub API {method} {url} (attempt {attempt + 1})", file=sys.stderr)
                 with urllib.request.urlopen(req, timeout=45) as resp:
                     data = resp.read().decode("utf-8", "ignore")
+                    if self.debug:
+                        remaining = resp.headers.get("x-ratelimit-remaining")
+                        print(
+                            f"[DEBUG] -> status={resp.status} ratelimit_remaining={remaining}",
+                            file=sys.stderr,
+                        )
                     return json.loads(data), dict(resp.headers)
             except urllib.error.HTTPError as e:
                 body = e.read().decode("utf-8", "ignore")
+                if self.debug:
+                    print(
+                        f"[DEBUG] HTTPError {e.code} for {method} {url}: {body[:200]}",
+                        file=sys.stderr,
+                    )
                 # naive rate limit/backoff handling
                 if e.code in (429, 502, 503) or (e.code == 403 and "rate limit" in body.lower()):
                     if attempt == 5:
@@ -96,7 +113,12 @@ class GitHub:
                     backoff *= 2
                     continue
                 raise
-            except urllib.error.URLError:
+            except urllib.error.URLError as e:
+                if self.debug:
+                    print(
+                        f"[DEBUG] URLError for {method} {url}: {e}",
+                        file=sys.stderr,
+                    )
                 if attempt == 5:
                     raise
                 time.sleep(backoff)
@@ -138,6 +160,13 @@ def iso_date_only(iso_str: str) -> str:
 
 def ensure_output_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def env_flag(name: str) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return False
+    return val.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def search_prs_in_window(gh: GitHub, owner: str, repo: str, since_iso: str, until_iso: str) -> List[Dict[str, Any]]:
@@ -352,16 +381,21 @@ def fetch_pr_full(gh: GitHub, owner: str, repo: str, number: int, since_iso: str
 
 def main() -> None:
     token = os.getenv("GITHUB_TOKEN")
+    if token:
+        token = token.strip()
     if not token:
         die("GITHUB_TOKEN is not set. Please export a GitHub token with repo read access.")
-    if token:
-        print(f"Using token: {token[:6]}...{token[-4:]}")
+    print(f"Using token: {token[:6]}...{token[-4:]}")
     if not GITHUB_OWNER or not GITHUB_REPO:
         die("Please edit GITHUB_OWNER and GITHUB_REPO at the top of the script.")
 
     since_iso, until_iso = compute_window(HOURS_BACK, TIMEZONE)
 
-    gh = GitHub(token)
+    debug_requests = env_flag("GITHUB_API_DEBUG") or env_flag("DEBUG_GITHUB_API")
+    if debug_requests:
+        print("[DEBUG] GitHub API debugging enabled.", file=sys.stderr)
+
+    gh = GitHub(token, debug=debug_requests)
 
     # Find candidate PR numbers via Search API (created/updated/merged in window)
     candidate_numbers = search_prs_in_window(gh, GITHUB_OWNER, GITHUB_REPO, since_iso, until_iso)
