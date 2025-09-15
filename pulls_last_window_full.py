@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.error
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -180,35 +180,67 @@ def env_flag(name: str) -> bool:
     return val.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def search_prs_in_window(gh: GitHub, owner: str, repo: str, since_iso: str, until_iso: str) -> List[Dict[str, Any]]:
-    """
-    Use the Search API to find PRs that were updated within the window.
-    We grab enough fields in detail later; here we only need PR numbers.
-    """
-    # GitHub search uses dates with YYYY-MM-DDTHH:MM:SSZ or offset; we'll pass the since in UTC form if needed
-    # Query both 'created' and 'updated' to not miss newly created + updated ones; also include 'merged' cutoff via filtering later.
-    # We'll fetch in pages until empty.
-    # Example q: repo:owner/name is:pr updated:>=2025-09-08T00:00:00-04:00
-    all_numbers = set()
-    for qualifier in ("created", "updated", "merged"):
+def list_pr_numbers_in_window(gh: GitHub, owner: str, repo: str, since_iso: str, until_iso: str) -> List[int]:
+    """Collect PR numbers updated/created/merged within the window using the pulls list API."""
+
+    def parse_iso(ts: Optional[str]) -> Optional[datetime]:
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    since_dt = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
+    until_dt = datetime.fromisoformat(until_iso.replace("Z", "+00:00"))
+
+    def in_window(ts: Optional[str]) -> bool:
+        ts_dt = parse_iso(ts)
+        if not ts_dt:
+            return False
+        return since_dt <= ts_dt < until_dt
+
+    numbers: Set[int] = set()
+
+    def process_sort(sort_key: str) -> None:
         page = 1
         while True:
-            q = f"repo:{owner}/{repo} is:pr {qualifier}:>={since_iso}"
-            params = {"q": q, "sort": "updated", "order": "desc", "per_page": 100, "page": page}
-            data, headers = gh._request("GET", "/search/issues", params)
-            items = data.get("items", [])
-            if not items:
+            params = {
+                "state": "all",
+                "sort": sort_key,
+                "direction": "desc",
+                "per_page": PAGE_SIZE,
+                "page": page,
+            }
+            data = gh.get(f"/repos/{owner}/{repo}/pulls", params)
+            if not isinstance(data, list) or not data:
                 break
-            for it in items:
-                # item number exists for PRs via search/issues; ensure it's a PR
-                if "pull_request" in it:
-                    all_numbers.add(it["number"])
+
+            stop_paging = False
+            for pr in data:
+                created_at = pr.get("created_at")
+                updated_at = pr.get("updated_at")
+                merged_at = pr.get("merged_at")
+
+                if any(in_window(ts) for ts in (created_at, updated_at, merged_at)):
+                    number = pr.get("number")
+                    if isinstance(number, int):
+                        numbers.add(number)
+
+                reference_ts = updated_at if sort_key == "updated" else created_at
+                reference_dt = parse_iso(reference_ts)
+                if reference_dt and reference_dt < since_dt:
+                    stop_paging = True
+
+            if stop_paging:
+                break
+
             page += 1
-            # Basic guard against excessive pages
-            if page > 50:
-                break
-    # We'll still filter precisely by timestamps once we fetch each PR detail below.
-    return sorted(all_numbers)
+
+    for sort_key in ("updated", "created"):
+        process_sort(sort_key)
+
+    return sorted(numbers)
 
 
 def fetch_pr_full(gh: GitHub, owner: str, repo: str, number: int, since_iso: str, until_iso: str) -> Optional[Dict[str, Any]]:
@@ -408,9 +440,9 @@ def main() -> None:
 
     gh = GitHub(token, debug=debug_requests)
 
-    # Find candidate PR numbers via Search API (created/updated/merged in window)
+    # Find candidate PR numbers via the pulls listing API (created/updated/merged in window)
     try:
-        candidate_numbers = search_prs_in_window(gh, GITHUB_OWNER, GITHUB_REPO, since_iso, until_iso)
+        candidate_numbers = list_pr_numbers_in_window(gh, GITHUB_OWNER, GITHUB_REPO, since_iso, until_iso)
     except PermissionError as e:
         die(str(e))
 
