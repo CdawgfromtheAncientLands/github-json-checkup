@@ -37,7 +37,7 @@ from dotenv import load_dotenv
 # =========================
 
 GITHUB_OWNER = "Cortado-Group"          # <-- EDIT: GitHub owner/org
-GITHUB_REPO  = "django-project"         # <-- EDIT: GitHub repository name
+GITHUB_REPO  = "django_project"         # <-- EDIT: GitHub repository name
 OUTPUT_DIR   = "./reports"         # <-- EDIT: folder to write JSON into
 HOURS_BACK   = 168                 # <-- EDIT: look back window (hours); 168 = 7 days
 TIMEZONE     = "America/New_York"  # <-- EDIT: used to compute the window
