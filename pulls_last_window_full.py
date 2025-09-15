@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # =========================
 # Configuration (EDIT ME)
 # =========================
+
 GITHUB_OWNER = "Cortado-Group"          # <-- EDIT: GitHub owner/org
 GITHUB_REPO  = "django-project"         # <-- EDIT: GitHub repository name
 OUTPUT_DIR   = "./reports"         # <-- EDIT: folder to write JSON into
@@ -50,6 +51,8 @@ INCLUDE_ISSUE_COMMENTS  = True      # top-level conversation comments
 INCLUDE_CHECKS_AND_STATUS = True    # check-runs + combined status per commit in the PR
 MAX_ITEMS_PER_SECTION = None        # e.g., set 500 to cap very large PRs; None = no cap
 
+from dotenv import load_dotenv
+load_dotenv()  # this will read the .env file into environment variables
 
 def die(msg: str) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
