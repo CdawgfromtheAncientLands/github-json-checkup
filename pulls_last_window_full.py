@@ -61,6 +61,14 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
+class GitHubError(RuntimeError):
+    """Base error for GitHub API issues."""
+
+
+class GitHubNotFoundError(GitHubError):
+    """Raised when the GitHub API reports a missing resource."""
+
+
 class GitHub:
     def __init__(self, token: str, base: str = "https://api.github.com", debug: bool = False):
         cleaned_token = (token or "").strip()
@@ -116,6 +124,9 @@ class GitHub:
                         "has the necessary repository scopes, and is SSO-authorized for the organization. "
                         f"Response: {snippet_text}"
                     ) from e
+                if e.code == 404:
+                    raise GitHubNotFoundError(self._format_not_found_message(method, url, body)) from e
+
                 # naive rate limit/backoff handling
                 if e.code in (429, 502, 503) or (e.code == 403 and "rate limit" in body.lower()):
                     if attempt == 5:
@@ -154,6 +165,39 @@ class GitHub:
                 return out[:limit]
             page += 1
         return out
+
+    def _format_not_found_message(self, method: str, url: str, body: str) -> str:
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path or url
+        message = self._extract_error_message(body)
+
+        repo_hint = ""
+        segments = path.lstrip("/").split("/")
+        if len(segments) >= 3 and segments[0] == "repos":
+            owner = segments[1]
+            repo = segments[2]
+            repo_hint = (
+                f"The repository '{owner}/{repo}' was not found or you do not have access to it. "
+                "Verify that GITHUB_OWNER and GITHUB_REPO are correct and that your GITHUB_TOKEN has the necessary permissions (including SSO authorization for private repositories). "
+            )
+
+        return f"GitHub API returned 404 for {method} {path}. {repo_hint}GitHub response: {message}"
+
+    @staticmethod
+    def _extract_error_message(body: str) -> str:
+        snippet = (body or "").strip()
+        if not snippet:
+            return "Not Found"
+        try:
+            parsed_body = json.loads(snippet)
+        except json.JSONDecodeError:
+            return snippet[:200]
+        if isinstance(parsed_body, dict):
+            for key in ("message", "error", "detail"):
+                val = parsed_body.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+        return snippet[:200]
 
 
 def compute_window(hours_back: int, tz_name: str) -> Tuple[str, str]:
@@ -443,7 +487,7 @@ def main() -> None:
     # Find candidate PR numbers via the pulls listing API (created/updated/merged in window)
     try:
         candidate_numbers = list_pr_numbers_in_window(gh, GITHUB_OWNER, GITHUB_REPO, since_iso, until_iso)
-    except PermissionError as e:
+    except (PermissionError, GitHubNotFoundError) as e:
         die(str(e))
 
     # Fetch and filter each PR fully
