@@ -73,8 +73,9 @@ class GitHub:
     def headers(self) -> Dict[str, str]:
         return {
             "Accept": "application/vnd.github+json",
-            "Authorization": f"token {self.token}",
+            "Authorization": f"Bearer {self.token}",
             "User-Agent": "pulls-last-window-full/1.0",
+            "X-GitHub-Api-Version": "2022-11-28",
         }
 
     def _request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Any, Dict[str, str]]:
@@ -105,6 +106,16 @@ class GitHub:
                         f"[DEBUG] HTTPError {e.code} for {method} {url}: {body[:200]}",
                         file=sys.stderr,
                     )
+                if e.code == 401:
+                    # Provide a clearer error for authentication problems before retrying.
+                    snippet = body.strip().splitlines()
+                    snippet_text = snippet[0] if snippet else "(no body)"
+                    raise PermissionError(
+                        "GitHub API returned 401 Unauthorized. "
+                        "Verify that your GITHUB_TOKEN (or fallback token source) is valid, "
+                        "has the necessary repository scopes, and is SSO-authorized for the organization. "
+                        f"Response: {snippet_text}"
+                    ) from e
                 # naive rate limit/backoff handling
                 if e.code in (429, 502, 503) or (e.code == 403 and "rate limit" in body.lower()):
                     if attempt == 5:
@@ -398,7 +409,10 @@ def main() -> None:
     gh = GitHub(token, debug=debug_requests)
 
     # Find candidate PR numbers via Search API (created/updated/merged in window)
-    candidate_numbers = search_prs_in_window(gh, GITHUB_OWNER, GITHUB_REPO, since_iso, until_iso)
+    try:
+        candidate_numbers = search_prs_in_window(gh, GITHUB_OWNER, GITHUB_REPO, since_iso, until_iso)
+    except PermissionError as e:
+        die(str(e))
 
     # Fetch and filter each PR fully
     prs: List[Dict[str, Any]] = []
@@ -407,6 +421,8 @@ def main() -> None:
             block = fetch_pr_full(gh, GITHUB_OWNER, GITHUB_REPO, num, since_iso, until_iso)
             if block:
                 prs.append(block)
+        except PermissionError as e:
+            die(str(e))
         except Exception as e:
             # Keep going; record a placeholder with error
             prs.append({"number": num, "error": str(e)})
