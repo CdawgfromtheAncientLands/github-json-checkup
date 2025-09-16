@@ -23,9 +23,7 @@ import json
 import os
 import time
 import sys
-import urllib.request
 import urllib.parse
-import urllib.error
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -69,6 +67,80 @@ class GitHubNotFoundError(GitHubError):
     """Raised when the GitHub API reports a missing resource."""
 
 
+class HttpClient:
+    def __init__(
+        self,
+        base: str,
+        token: str,
+        timeout_seconds: float = 15,
+        debug: bool = False,
+    ) -> None:
+        self.base = base
+        self.timeout = timeout_seconds
+        self.debug = debug
+        self._headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "github-json-checkup",
+        }
+        self._transport_exceptions: Tuple[type, ...]
+        try:
+            import httpx  # type: ignore
+
+            self._client = httpx.Client(
+                base_url=base,
+                http2=True,
+                timeout=timeout_seconds,
+                headers=dict(self._headers),
+            )
+            self._transport_exceptions = (httpx.HTTPError,)
+            self._using_httpx = True
+        except ImportError:
+            import requests  # type: ignore
+
+            session = requests.Session()
+            session.headers.update(self._headers)
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=50,
+                pool_maxsize=50,
+                max_retries=0,
+            )
+            session.mount("https://", adapter)
+            self._client = session
+            self._transport_exceptions = (requests.exceptions.RequestException,)
+            self._using_httpx = False
+
+    def headers(self) -> Dict[str, str]:
+        return dict(self._headers)
+
+    @property
+    def transport_exceptions(self) -> Tuple[type, ...]:
+        return self._transport_exceptions
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        json: Optional[Any] = None,
+    ):
+        if getattr(self, "_using_httpx", False):
+            return self._client.request(method, path, params=params, json=json)
+
+        url = urllib.parse.urljoin(self.base, path)
+        return self._client.request(  # type: ignore[no-any-return]
+            method,
+            url,
+            params=params,
+            json=json,
+            timeout=self.timeout,
+        )
+
+    def get(self, path: str, params: Optional[Dict[str, Any]] = None):
+        return self.request("GET", path, params=params)
+
+
 class GitHub:
     def __init__(self, token: str, base: str = "https://api.github.com", debug: bool = False):
         cleaned_token = (token or "").strip()
@@ -77,45 +149,66 @@ class GitHub:
         self.base = base
         self.token = cleaned_token
         self.debug = debug
+        self.http_client = HttpClient(base, cleaned_token, timeout_seconds=45, debug=debug)
 
     def headers(self) -> Dict[str, str]:
-        return {
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {self.token}",
-            "User-Agent": "pulls-last-window-full/1.0",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
+        return self.http_client.headers()
 
-    def _request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Any, Dict[str, str]]:
-        if params:
-            qs = urllib.parse.urlencode(params, doseq=True)
-            url = f"{self.base}{path}?{qs}"
-        else:
-            url = f"{self.base}{path}"
-        req = urllib.request.Request(url, method=method, headers=self.headers())
+    def _build_url(self, path: str, params: Optional[Dict[str, Any]]) -> str:
+        base_url = urllib.parse.urljoin(self.base, path)
+        if not params:
+            return base_url
+        qs = urllib.parse.urlencode(params, doseq=True)
+        return f"{base_url}?{qs}"
+
+    def _redact_token(self, value: str) -> str:
+        if not self.token:
+            return value
+        return value.replace(self.token, "<redacted>")
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Any] = None,
+    ) -> Tuple[Any, int, Dict[str, str]]:
+        url = self._build_url(path, params)
         backoff = 2.0
         for attempt in range(6):
             try:
                 if self.debug:
-                    print(f"[DEBUG] GitHub API {method} {url} (attempt {attempt + 1})", file=sys.stderr)
-                with urllib.request.urlopen(req, timeout=45) as resp:
-                    data = resp.read().decode("utf-8", "ignore")
-                    if self.debug:
-                        remaining = resp.headers.get("x-ratelimit-remaining")
-                        print(
-                            f"[DEBUG] -> status={resp.status} ratelimit_remaining={remaining}",
-                            file=sys.stderr,
-                        )
-                    return json.loads(data), dict(resp.headers)
-            except urllib.error.HTTPError as e:
-                body = e.read().decode("utf-8", "ignore")
-                if self.debug:
                     print(
-                        f"[DEBUG] HTTPError {e.code} for {method} {url}: {body[:200]}",
+                        f"[DEBUG] GitHub API {method} {self._redact_token(url)} (attempt {attempt + 1})",
                         file=sys.stderr,
                     )
-                if e.code == 401:
-                    # Provide a clearer error for authentication problems before retrying.
+                response = self.http_client.request(
+                    method,
+                    path,
+                    params=params,
+                    json=json_body,
+                )
+                status_code = getattr(response, "status_code", None)
+                headers = dict(response.headers) if hasattr(response, "headers") else {}
+                if hasattr(response, "content"):
+                    raw_body = response.content
+                    if isinstance(raw_body, bytes):
+                        body = raw_body.decode("utf-8", "ignore")
+                    else:
+                        body = str(raw_body)
+                elif hasattr(response, "text"):
+                    body = str(response.text)
+                else:
+                    body = ""
+                if self.debug:
+                    remaining = headers.get("x-ratelimit-remaining")
+                    print(
+                        f"[DEBUG] -> status={status_code} ratelimit_remaining={remaining}",
+                        file=sys.stderr,
+                    )
+
+                body = body or ""
+                if status_code == 401:
                     snippet = body.strip().splitlines()
                     snippet_text = snippet[0] if snippet else "(no body)"
                     raise PermissionError(
@@ -123,22 +216,44 @@ class GitHub:
                         "Verify that your GITHUB_TOKEN (or fallback token source) is valid, "
                         "has the necessary repository scopes, and is SSO-authorized for the organization. "
                         f"Response: {snippet_text}"
-                    ) from e
-                if e.code == 404:
-                    raise GitHubNotFoundError(self._format_not_found_message(method, url, body)) from e
+                    )
+                if status_code == 404:
+                    raise GitHubNotFoundError(
+                        self._format_not_found_message(method, url, body)
+                    )
 
-                # naive rate limit/backoff handling
-                if e.code in (429, 502, 503) or (e.code == 403 and "rate limit" in body.lower()):
+                if status_code in (429, 502, 503) or (
+                    status_code == 403 and "rate limit" in body.lower()
+                ):
+                    if self.debug:
+                        print(
+                            f"[DEBUG] HTTPError {status_code} for {method} {self._redact_token(url)}: {body[:200]}",
+                            file=sys.stderr,
+                        )
                     if attempt == 5:
-                        raise
+                        raise GitHubError(
+                            f"GitHub API returned {status_code} for {method} {path}: {self._extract_error_message(body)}"
+                        )
                     time.sleep(backoff)
                     backoff *= 2
                     continue
-                raise
-            except urllib.error.URLError as e:
+
+                if status_code is None or status_code >= 400:
+                    if self.debug:
+                        print(
+                            f"[DEBUG] HTTPError {status_code} for {method} {self._redact_token(url)}: {body[:200]}",
+                            file=sys.stderr,
+                        )
+                    raise GitHubError(
+                        f"GitHub API returned {status_code} for {method} {path}: {self._extract_error_message(body)}"
+                    )
+
+                data = json.loads(body) if body else None
+                return data, status_code, headers
+            except self.http_client.transport_exceptions as e:  # type: ignore[misc]
                 if self.debug:
                     print(
-                        f"[DEBUG] URLError for {method} {url}: {e}",
+                        f"[DEBUG] Transport error for {method} {self._redact_token(url)}: {e}",
                         file=sys.stderr,
                     )
                 if attempt == 5:
@@ -157,7 +272,7 @@ class GitHub:
         out: List[Any] = []
         while True:
             params.update({"per_page": per_page, "page": page})
-            data, headers = self._request("GET", path, params)
+            data, _status, headers = self._request("GET", path, params)
             if not isinstance(data, list) or not data:
                 break
             out.extend(data)
